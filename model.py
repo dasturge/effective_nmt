@@ -1,19 +1,21 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.cuda
 
 from vocab import Vocab
+
+torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
 
 class Encoder(nn.Module):
 
     def __init__(self, name: str, vocab: Vocab, embedding_size: int,
-                 n_hidden: int, lstm_layers: int):
+                 n_hidden: int, lstm_layers: int, device=torch):
         super().__init__()
         self.__name__ = name
 
         # Saving this so that other parts of the class can re-use it
-        self.n_dims = n_hidden
+        self.n_hidden = n_hidden
         self.n_layers = lstm_layers
 
         # word embeddings:
@@ -21,9 +23,9 @@ class Encoder(nn.Module):
                                          embedding_dim=embedding_size)
 
         self.lstm = nn.LSTM(input_size=embedding_size,
-                            hidden_size=self.n_dims,
+                            hidden_size=self.n_hidden,
                             num_layers=self.n_layers,
-                            bidirectional=True)
+                            bidirectional=False)
 
     def forward(self, input, hidden):
         embedding = self.input_lookup(input)
@@ -32,8 +34,8 @@ class Encoder(nn.Module):
         return output, hidden
 
     def init_hidden(self):
-        h0 = torch.zeros(2 * self.n_layers, 1, self.n_dims)
-        c0 = torch.zeros(2 * self.n_layers, 1, self.n_dims)
+        h0 = torch.zeros(self.n_layers, 1, self.n_hidden).cuda()
+        c0 = torch.zeros(self.n_layers, 1, self.n_hidden).cuda()
         return h0, c0
 
 
@@ -47,7 +49,7 @@ class Decoder(nn.Module):
         n_pt_weights = n_hidden
 
         # Saving this so that other parts of the class can re-use it
-        self.n_dims = n_hidden
+        self.n_hidden = n_hidden
         self.n_layers = lstm_layers
         self.local_window = local_window
 
@@ -56,66 +58,74 @@ class Decoder(nn.Module):
                                           embedding_dim=embedding_size)
 
         # attention module
-        self.p_t_dense = nn.Linear(n_hidden, n_pt_weights)
-        self.p_t_dot = nn.Linear(n_pt_weights, 1)
-        self.score = nn.Bilinear(self.n_dims, 2 * self.local_window + 1, 1)
+        self.p_t_dense = nn.Linear(self.n_hidden, n_pt_weights, bias=False)
+        self.p_t_dot = nn.Linear(n_pt_weights, 1, bias=False)
+        self.score = nn.Bilinear(self.n_hidden, self.n_hidden, 1, bias=False)  # ?
 
-        self.lstm = nn.LSTM(input_size=embedding_size,
-                            hidden_size=self.n_dims,
+        self.combine_attention = nn.Linear(2 * self.n_hidden, self.n_hidden)
+
+        self.lstm = nn.LSTM(input_size=embedding_size + self.n_hidden,
+                            hidden_size=self.n_hidden,
                             num_layers=self.n_layers,
                             bidirectional=False)
 
-        self.dense_out = nn.Linear(self.n_dims, vocab.size)
+        self.dense_out = nn.Linear(self.n_hidden, vocab.size)
 
         self.softmax = nn.LogSoftmax(dim=-1)
 
-    def forward(self, input, h_t, h_s):
-        embedding = self.output_lookup(input)
-
-        # attention
-        p_t = h_s.size(0) * F.sigmoid(self.p_t_dot(F.tanh(self.p_t_dense(h_t[0]))))  # (9)
-        s = torch.round(p_t).long()
-        D = self.local_window
-        h_s_local = h_s[s - D:s + D + 1]  # @@@@@ zero pad! @@@@@
-        score = self.score(h_t[0], h_s_local)  # (8) (general)  may have to use einsum here to do bilinear layer, or batch over source inputs
-        gauss_window = torch.exp((torch.range(s - D, s + D + 1) - p_t) ** 2 / (D / 2) ** 2)  # (10)
-        a_t = F.softmax(score) * gauss_window  # (7), (10)
-        context = a_t * h_s_local
-        hidden = torch.cat(context, h_t)
+    def forward(self, input, hidden, h_s, h_t_tilde):
+        embedding = self.output_lookup(input.view(1, 1))
+        context_embedding = torch.cat((embedding, h_t_tilde), dim=-1)
 
         # lstm
-        output, h_t = self.lstm(embedding, hidden)
-        output = F.log_softmax(self.dense_out(output[0]), dim=1)
-        return output, h_t, (context, s)
+        output, hidden = self.lstm(context_embedding, hidden)
+
+        # attention
+        h_t = hidden[0][-1]  # ? correct?  Or should I concat on last axis?
+        p_t = h_s.size(0) * torch.sigmoid(self.p_t_dot(torch.tanh(self.p_t_dense(h_t)))).squeeze()  # (9)
+        s = torch.round(p_t).long().cuda()
+        D = self.local_window
+        minimum, maximum = max(s - D, 0), min(s + D, h_s.size(0) - 1)
+        h_s_local = h_s[minimum:maximum + 1]  # @@@@@ zero pad? @@@@@
+        h_t_rep = h_t.repeat(h_s_local.size(0), 1, 1)
+        score = self.score(h_t_rep, h_s_local)  # (8) (general)
+        gauss_window = torch.exp((torch.arange(minimum, maximum + 1).float() - p_t) ** 2 / (D / 2) ** 2).view(-1, 1, 1).cuda()
+        a_t = torch.softmax(score, dim=0) * gauss_window  # (7) & (10)
+        context = torch.mean(a_t * h_s_local, dim=0, keepdim=True)
+        h_t_tilde = torch.tanh(self.combine_attention(torch.cat((context, h_t.view(1, 1, -1)), dim=-1)))  # (5)
+        y = self.softmax(self.dense_out(h_t_tilde))  # (6)
+
+        return y, hidden, h_t_tilde, (a_t, p_t)
 
 
-def train(x, y, encoder, decoder, encoder_optimizer, decoder_optimizer, loss_fn):
-    encoder_hidden = encoder.init_hidden()  # is random any good here?
+def train(x, y, encoder, decoder, encoder_optimizer, decoder_optimizer, loss_fn, step=True, clipping=0.25):
+    hidden = encoder.init_hidden()
 
-    encoder_optimizer.zero_grad()
-    decoder_optimizer.zero_grad()
-
-    input_length = x.size(0)
     target_length = y.size(0)
 
     loss = 0
     x = x.view(-1, 1)
-    h_s, h_t = encoder(x, encoder_hidden)
+    h_s, hidden = encoder(x, hidden)
 
-    bos = torch.tensor([[0]])  # BOS_TOKEN @@@@@@@ STARTING TO QUESTION THIS, SHOULDNT INPUT BE FINAL h_s??? @@@@@@@
-    yhati = bos
-    h_t = h_t  # ? for the beginning of the decoder I'm not sure how to handle this properly...  Ask Bedricks? Reinit?
+    bos = torch.tensor([[0]]).cuda()  # BOS_TOKEN @@@@@@@ STARTING TO QUESTION THIS, SHOULDNT INPUT BE FINAL h_s??? @@@@@@@
+    inp = bos
+    h_t_tilde = hidden[0][-1].unsqueeze(0) * 0
     for di in range(target_length):
-        yhati, h_t, decoder_attention = decoder(yhati, h_t, h_s)
-        topv, topi = yhati.topk(1)
-        decoder_input = topi.squeeze().detach()  # detach from history as input
-        loss += loss_fn(yhati, y[di])
-        if decoder_input.item() == 1:  # EOS_TOKEN
+        logits, hidden, h_t_tilde, decoder_attention = decoder(inp, hidden, h_s, h_t_tilde)
+        topv, topi = logits.topk(1)
+        inp = topi.squeeze().detach()  # detach from history as input
+        loss += loss_fn(logits.view(1, -1), y[di].view(1))
+        if inp.item() == 1:  # EOS_TOKEN
             break
 
     loss.backward()
+    nn.utils.clip_grad_norm_(encoder.parameters(), clipping)
+    nn.utils.clip_grad_norm_(decoder.parameters(), clipping)
 
-    encoder_optimizer.step()
-    decoder_optimizer.step()
+    if step:
+        encoder_optimizer.step()
+        decoder_optimizer.step()
+        encoder_optimizer.zero_grad()
+        decoder_optimizer.zero_grad()
 
     return loss.item() / target_length

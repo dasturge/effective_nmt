@@ -81,7 +81,7 @@ class Vocab:
     def tokens2vector(self, tokens, pad=True):
         # return a list of indices from a list of tokens
         t2i = self.token2index
-        seq = [0] + [t2i[t] for t in tokens] + [1]
+        seq = [t2i[t] for t in tokens]
         return seq
 
     def tokens2tensor(self, tokens):
@@ -89,6 +89,11 @@ class Vocab:
         indices = self.tokens2vector(tokens)
         tensor = torch.Tensor(indices).long()
         return tensor
+
+    def tensor2tokens(self, tensor):
+        # helper function for converting a tensor back to words
+        tokens = [self.index2token[index.item()] for index in tensor]
+        return tokens
 
     @staticmethod
     def from_text(sentences, langid='noname'):
@@ -103,12 +108,14 @@ class Vocab:
         return nltk.sent_tokenize(text, language=language)
 
     @staticmethod
-    def word_tokenize(sentence, language='english', pad=False):
+    def word_tokenize(sentence, language='english', pad=False, reverse=False):
         # calls preprocessing on the sentence and then tokenizes
         sentence = Vocab.sentence_preprocess(sentence, language)
         words = nltk.word_tokenize(sentence, language=language)
+        if reverse:
+            words = words[::-1]
         if pad:
-            words = [BOS_SYM] + words + [EOS_SYM]
+            words = words + [EOS_SYM]
         return words
 
     @staticmethod
