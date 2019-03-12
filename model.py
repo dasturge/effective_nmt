@@ -10,7 +10,7 @@ torch.set_default_tensor_type(torch.cuda.FloatTensor)
 class Encoder(nn.Module):
 
     def __init__(self, name: str, vocab: Vocab, embedding_size: int,
-                 n_hidden: int, lstm_layers: int, device=torch):
+                 n_hidden: int, lstm_layers: int):
         super().__init__()
         self.__name__ = name
 
@@ -37,6 +37,53 @@ class Encoder(nn.Module):
         h0 = torch.zeros(self.n_layers, 1, self.n_hidden).cuda()
         c0 = torch.zeros(self.n_layers, 1, self.n_hidden).cuda()
         return h0, c0
+
+
+class VanillaDecoder(nn.Module):
+
+    def __init__(self, name: str, vocab: Vocab, embedding_size: int,
+                 n_hidden: int, lstm_layers: int, local_window: int):
+        super().__init__()
+        self.__name__ = name
+
+        n_pt_weights = n_hidden
+
+        # Saving this so that other parts of the class can re-use it
+        self.n_hidden = n_hidden
+        self.n_layers = lstm_layers
+        self.local_window = local_window
+
+        # word embeddings:
+        self.output_lookup = nn.Embedding(num_embeddings=vocab.size,
+                                          embedding_dim=embedding_size)
+
+        # attention module
+        self.p_t_dense = nn.Linear(self.n_hidden, n_pt_weights, bias=False)
+        self.p_t_dot = nn.Linear(n_pt_weights, 1, bias=False)
+        self.score = nn.Bilinear(self.n_hidden, self.n_hidden, 1, bias=False)  # ?
+
+        self.combine_attention = nn.Linear(2 * self.n_hidden, self.n_hidden)
+
+        self.lstm = nn.LSTM(input_size=embedding_size,  # + self.n_hidden
+                            hidden_size=self.n_hidden,
+                            num_layers=self.n_layers,
+                            bidirectional=False,
+                            dropout=0.2)
+
+        self.dense_out = nn.Linear(self.n_hidden, vocab.size)
+
+        self.softmax = nn.LogSoftmax(dim=-1)
+
+    def forward(self, input, hidden, h_s, h_t_tilde):
+        embedding = self.output_lookup(input.view(1, 1))
+        # context_embedding = torch.cat((embedding, h_t_tilde), dim=-1)
+
+        # lstm
+        output, hidden = self.lstm(embedding, hidden)
+
+        y = self.softmax(self.dense_out(output))
+        a_t, p_t = None, None  # just to have the same inputs/outputs as the decoder
+        return y, hidden, h_t_tilde, (a_t, p_t)
 
 
 class Decoder(nn.Module):
@@ -67,7 +114,8 @@ class Decoder(nn.Module):
         self.lstm = nn.LSTM(input_size=embedding_size + self.n_hidden,
                             hidden_size=self.n_hidden,
                             num_layers=self.n_layers,
-                            bidirectional=False)
+                            bidirectional=False,
+                            dropout=0.2)
 
         self.dense_out = nn.Linear(self.n_hidden, vocab.size)
 
@@ -75,6 +123,7 @@ class Decoder(nn.Module):
 
     def forward(self, input, hidden, h_s, h_t_tilde):
         embedding = self.output_lookup(input.view(1, 1))
+
         context_embedding = torch.cat((embedding, h_t_tilde), dim=-1)
 
         # lstm

@@ -55,8 +55,8 @@ y = list(y)
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4)
 
-encoder = Encoder('encoder', vocab=en_lang, embedding_size=70, n_hidden=50, lstm_layers=2)
-decoder = Decoder('decoder', vocab=es_lang, embedding_size=70, n_hidden=50, lstm_layers=2, local_window=2)
+encoder = Encoder('encoder', vocab=en_lang, embedding_size=50, n_hidden=50, lstm_layers=2)
+decoder = Decoder('decoder', vocab=es_lang, embedding_size=50, n_hidden=50, lstm_layers=2, local_window=3)
 encoder = encoder.cuda()
 decoder = decoder.cuda()
 
@@ -70,9 +70,14 @@ plot_loss_total = 0  # Reset every plot_every
 
 N = len(X_train)
 
+# cudafy inputs
+for i, (xi, yi) in enumerate(zip(X_train, y_train)):
+    X_train[i] = xi.cuda()
+    y_train[i] = yi.cuda()
+
 for iter in range(1, 10000000):
-    input_tensor = X_train[(iter - 1) % N].cuda()
-    target_tensor = y_train[(iter - 1) % N].cuda()
+    input_tensor = X_train[(iter - 1) % N]
+    target_tensor = y_train[(iter - 1) % N]
     if iter % 20 == 0:
         loss = train(input_tensor, target_tensor, encoder, decoder, opt1, opt2, nn.NLLLoss(), step=True)
     else:
@@ -80,6 +85,6 @@ for iter in range(1, 10000000):
     print_loss_total += loss
     plot_loss_total += loss
     if iter % 1000 == 0:
-        print_loss_avg = print_loss_total / 100
+        print_loss_avg = print_loss_total / 1000
         print_loss_total = 0
         print('%.4f' % (print_loss_avg))
