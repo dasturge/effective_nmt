@@ -108,13 +108,15 @@ class Vocab:
         return nltk.sent_tokenize(text, language=language)
 
     @staticmethod
-    def word_tokenize(sentence, language='english', pad=False, reverse=False):
+    def word_tokenize(sentence, language='english', pad=False, pad_both=False, reverse=False):
         # calls preprocessing on the sentence and then tokenizes
         sentence = Vocab.sentence_preprocess(sentence, language)
         words = nltk.word_tokenize(sentence, language=language)
         if reverse:
             words = words[::-1]
-        if pad:
+        if pad_both:
+            words = [BOS_SYM] + words + [EOS_SYM]
+        elif pad:
             words = words + [EOS_SYM]
         return words
 
