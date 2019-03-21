@@ -59,7 +59,7 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
 
     def __init__(self, name: str, vocab: Vocab, embedding_size: int,
-                 n_hidden: int, lstm_layers: int, local_window: int):
+                 n_hidden: int, lstm_layers: int, local_window):
         """
         Decoder Module with Attention Mechanism for neural machine translation
         :param name: name for object instance
@@ -112,7 +112,7 @@ class Decoder(nn.Module):
         # attention
         if self.local_window:
             # local
-            h_t = hidden[0][-1]
+            h_t = hidden[0][-1].view(1, -1)
             p_t = h_s.size(0) * torch.sigmoid(self.p_t_dot(torch.tanh(self.p_t_dense(h_t)))).squeeze()  # (9)
             s = torch.round(p_t).long().cuda()
             D = self.local_window
@@ -184,9 +184,9 @@ class NMT:
             for n in range(N):
                 xi = X[n]
                 yi = y[n]
-                step = not n % batch_size or n == N - 1
-                print_loss_total += self._train(xi, yi, clipping, step=step, loss_factor=batch_size) * batch_size
-                if step and 100 * n // N > prev_log_percent + print_every:
+                step = True
+                print_loss_total += self._train(xi.cuda(), yi.cuda(), clipping, step=step, loss_factor=batch_size) * batch_size
+                if step and 100 * n // N >= prev_log_percent + print_every:
                     print_loss_avg = print_loss_total / (n - prev_log_iter)
                     prev_log_iter = n
                     prev_log_percent = 100 * n // N
@@ -224,8 +224,8 @@ class NMT:
     def save(self, path=None):
         if not path:
             path = os.path.join('.', self.name)
-        encoder = os.path.join(path, '_encoder')
-        decoder = os.path.join(path, '_decoder')
+        encoder = path + '_encoder'
+        decoder = path + '_decoder'
         torch.save(self.encoder.state_dict(), encoder)
         torch.save(self.decoder.state_dict(), decoder)
 
@@ -270,7 +270,7 @@ class NMT:
             if inp.item() == 1:  # EOS_TOKEN
                 break
             inp = y[di]
-
+        loss = loss / target_length
         loss.backward()
         nn.utils.clip_grad_norm_((*self.encoder.parameters(), *self.decoder.parameters()), clipping)
 
@@ -284,7 +284,7 @@ class NMT:
 class VanillaDecoder(nn.Module):
 
     def __init__(self, name: str, vocab: Vocab, embedding_size: int,
-                 n_hidden: int, lstm_layers: int, local_window: int):
+                 n_hidden: int, lstm_layers: int):
         """
         Decoder Module without an attention mechanism, for comparison.
         See Decoder for parameter help.
@@ -294,22 +294,22 @@ class VanillaDecoder(nn.Module):
 
         n_pt_weights = n_hidden
         self.lut = vocab.tokens2tensor
+        self.out_lut = vocab.tensor2tokens
 
         # Saving this so that other parts of the class can re-use it
         self.n_hidden = n_hidden
         self.n_layers = lstm_layers
-        self.local_window = local_window
 
         # word embeddings:
         self.output_lookup = nn.Embedding(num_embeddings=vocab.size,
                                           embedding_dim=embedding_size)
 
         # attention module
-        self.p_t_dense = nn.Linear(self.n_hidden, n_pt_weights, bias=False)
-        self.p_t_dot = nn.Linear(n_pt_weights, 1, bias=False)
-        self.score = nn.Bilinear(self.n_hidden, self.n_hidden, 1, bias=False)  # ?
+        #self.p_t_dense = nn.Linear(self.n_hidden, n_pt_weights, bias=False)
+        #self.p_t_dot = nn.Linear(n_pt_weights, 1, bias=False)
+        #self.score = nn.Bilinear(self.n_hidden, self.n_hidden, 1, bias=False)  # ?
 
-        self.combine_attention = nn.Linear(2 * self.n_hidden, self.n_hidden)
+        #self.combine_attention = nn.Linear(2 * self.n_hidden, self.n_hidden)
 
         self.lstm = nn.LSTM(input_size=embedding_size,  # + self.n_hidden
                             hidden_size=self.n_hidden,

@@ -72,11 +72,13 @@ class Vocab:
     def calcify(self):
         # ensure no new tokens can be added, create unkown token
         items = self._token2index.items()
-        unk_index = self.size
-        self._token2index = defaultdict(lambda: unk_index, items)
+        self._token2index = defaultdict(self.unk, items)
         _ = self._token2index['<unk>']
         self._index2token = self.index2token
         self.calcified = True
+
+    def unk(self):
+        return self.size
 
     def tokens2vector(self, tokens, pad=True):
         # return a list of indices from a list of tokens

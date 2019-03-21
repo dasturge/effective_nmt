@@ -1,5 +1,6 @@
 import pickle
 import os
+import re
 import tarfile
 import time
 
@@ -11,15 +12,13 @@ import torch.optim as optim
 #from nltk.translate import bleu_score
 from sklearn.model_selection import train_test_split
 
-from model import Encoder, Decoder, NMT
+from model import Encoder, Decoder, NMT, VanillaDecoder
 from vocab import Vocab, VocabFull
 
 
 # data data data
-englishfile = 'data/europarl-v7.es-en.en'
-spanishfile = 'data/europarl-v7.es-en.es'
-
-
+englishfile = 'data/europarl-v7.es-en_truncated.en'
+spanishfile = 'data/europarl-v7.es-en_truncated.es'
 
 # collect our data
 language = 'es'
@@ -60,41 +59,77 @@ def build_full_vocabs():
     return en_lang, es_lang
 
 
-def corpora2vectors(reverse_inputs=True, pad_spanish=True):
+def corpora2vectors(limit=None):
     with open(englishfile) as en_fd, open(spanishfile) as es_fd:
-        garbage_filter = lambda x: x.strip() and x.strip() != '.' # and len(x...
-        eng = [en_lang.tokens2tensor(en_lang.word_tokenize(s, reverse=reverse_inputs)) for s in en_fd]
-        es = [es_lang.tokens2tensor(es_lang.word_tokenize(s, pad=pad_spanish)) for s in es_fd]
-    return eng, es
+        eng = []
+        esp = []
+        reg = re.compile(r'[a-zA-Z]')
+        for i, (en, es) in enumerate(zip(en_fd, es_fd)):
+            en = en.strip()
+            es = es.strip()
+            if not reg.search(en):
+                continue
+            if not reg.search(es):
+                continue
+            eng.append(en_lang.tokens2tensor(en_lang.word_tokenize(en)))
+            esp.append(es_lang.tokens2tensor(es_lang.word_tokenize(es)))
+            if i == limit:
+                break
+    return eng, esp
 
 
-en_lang, es_lang = build_full_vocabs()
+if os.path.exists('en_lang.pkl'):
+    with open('en_lang.pkl', 'rb') as fd:
+        en_lang = pickle.load(fd)
+    with open('es_lang.pkl', 'rb') as fd:
+        es_lang = pickle.load(fd)
+else:
+    print('building vocabulary')
+    en_lang, es_lang = build_full_vocabs()
+    with open('en_lang.pkl', 'wb') as fd:
+        try:
+            pickle.dump(en_lang, fd)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+    with open('es_lang.pkl', 'wb') as fd:
+        try:
+            pickle.dump(es_lang, fd)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
 if os.path.exists('X.pkl'):
     with open('X.pkl', 'rb') as fd:
         X = pickle.load(fd)
     with open('y.pkl', 'rb') as fd:
         y = pickle.load(fd)
 else:
-    X, y = corpora2vectors()
+    print('building english, spanish data sets')
+    X, y = corpora2vectors(limit=200000)
+    # filter vectors:
+    X, y = zip(*((i, j) for i, j in zip(X, y) if len(i) and len(j) != 1))
+    X = list(X)
+    y = list(y)
     with open('X.pkl', 'wb') as fd:
         pickle.dump(X, fd)
     with open('y.pkl', 'wb') as fd:
         pickle.dump(y, fd)
 
-# filter vectors:
-X, y = zip(*((i, j) for i, j in zip(X, y) if len(i) and len(j) != 1))
-X = list(X)
-y = list(y)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+with open('X_test.pkl', 'wb') as fd:
+    pickle.dump(X_test, fd)
+with open('y_test.pkl', 'wb') as fd:
+    pickle.dump(y_test, fd)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4)
-
-encoder = Encoder('encoder', vocab=en_lang, embedding_size=70, n_hidden=70, lstm_layers=2)
-decoder = Decoder('decoder', vocab=es_lang, embedding_size=70, n_hidden=70, lstm_layers=2, local_window=2)
+encoder = Encoder('encoder', vocab=en_lang, embedding_size=150, n_hidden=100, lstm_layers=2)
+decoder = Decoder('decoder', vocab=es_lang, embedding_size=150, n_hidden=100, lstm_layers=2, local_window=2)
 encoder = encoder.cuda()
 decoder = decoder.cuda()
 
-opt1 = optim.Adam(encoder.parameters(), lr=1e-4)
-opt2 = optim.Adam(decoder.parameters(), lr=1e-4)
+encoder2 = Encoder('encoder', vocab=en_lang, embedding_size=150, n_hidden=100, lstm_layers=2)
+decoder2 = VanillaDecoder('decoder', vocab=es_lang, embedding_size=150, n_hidden=100, lstm_layers=2)
+encoder2 = encoder2.cuda()
+decoder2 = decoder2.cuda()
 
 start = time.time()
 plot_losses = []
@@ -108,50 +143,23 @@ N = len(X_train)
 epoch = 0
 prev_percent = 0
 
-# cudafy inputs
-for i, (xi, yi) in enumerate(zip(X_train, y_train)):
-    X_train[i] = xi.cuda()
-    y_train[i] = yi.cuda()
+nmt = NMT('nmt_local', encoder, decoder, nn.NLLLoss())
+nmt_vanilla = NMT('nmt_vanilla', encoder2, decoder2, nn.NLLLoss())
+import sys
+sys.stdout = open('log.txt', 'a')
+for tens in y_test[:5]:
+    print(' '.join(es_lang.tensor2tokens(tens)))
+for i in range(100):
+    print('local')
+    nmt.train(X_train, y_train, epochs=1, batch_size=1, print_every=10, examples=X_test[:5])
+    nmt.save(path='nmt_local_%s' % i)
+    print('no attention')
+    nmt_vanilla.train(X_train, y_train, epochs=1, batch_size=1, print_every=10, examples=X_test[:5])
+    nmt_vanilla.save(path='nmt_vanilla_%s' % i)
 
-
-nmt = NMT('nmt', encoder, decoder, nn.NLLLoss())
-nmt.train(X_train, y_train, epochs=100, batch_size=1, examples=X_test[:5])
-nmt.save()
+for i in range(10):
+    nmt = NMT('nmt_')
 
 if True:
     import sys
     sys.exit()
-for iter in range(1, 10000000):
-    input_tensor = X_train[(iter - 1) % N]
-    target_tensor = y_train[(iter - 1) % N]
-    if iter % batch_size == 0:
-        loss = train(input_tensor, target_tensor, encoder, decoder, opt1, opt2, nn.NLLLoss(), step=True)
-    else:
-        loss = train(input_tensor, target_tensor, encoder, decoder, opt1, opt2, nn.NLLLoss(), step=False)
-    print_loss_total += loss
-    plot_loss_total += loss
-    if (iter - (N // iter)) / 100 > prev_percent:
-        prev_percent += 1
-        print_loss_avg = print_loss_total / 1000
-        print_loss_total = 0
-        print('\repoch %s: %%%s  avg loss: %.4f' % (epoch, prev_percent, print_loss_avg))
-    if iter % N == 0:
-        epoch += 1
-        prev_percent = 0
-        if epoch >= 12:
-            for param in opt1.param_groups:
-                param['lr'] /= 2
-            for param in opt2.param_groups:
-                param['lr'] /= 2
-        encoded, hidden = encoder(X_test[5].view(-1, 1), encoder.init_hidden())
-        inp = torch.tensor([[1]]).cuda()  # EOS_TOKEN
-        h_t_tilde = hidden[0][-1].unsqueeze(0) * 0
-        output = []
-        for di in range(20):
-            logits, hidden, h_t_tilde, decoder_attention = decoder(inp, hidden, encoded, h_t_tilde)
-            topv, topi = logits.topk(1)
-            inp = topi.squeeze().detach()  # detach from history as input
-            if inp.item() == 1:  # EOS_TOKEN
-                break
-            output.append(inp)
-        print(' '.join(decoder.out_lut(output)))
