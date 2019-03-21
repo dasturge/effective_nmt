@@ -1,11 +1,14 @@
+import pickle
+import os
+import tarfile
 import time
 
+import requests
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-import pickle
-from nltk.translate import bleu_score
+#from nltk.translate import bleu_score
 from sklearn.model_selection import train_test_split
 
 from model import Encoder, Decoder, NMT
@@ -13,8 +16,31 @@ from vocab import Vocab, VocabFull
 
 
 # data data data
-englishfile = 'data/europarl-v7.es-en_trunc.en'
-spanishfile = 'data/europarl-v7.es-en_trunc.es'
+englishfile = 'data/europarl-v7.es-en.en'
+spanishfile = 'data/europarl-v7.es-en.es'
+
+
+
+# collect our data
+language = 'es'
+tarfilename = "{}-en.tgz".format(language)
+tarfilepath = os.path.join("data/", tarfilename)
+def maybe_download():
+    if not os.path.exists(tarfilepath):
+        print('downloading {}...'.format(tarfilename))
+        url = "http://www.statmt.org/europarl/v7/{}".format(tarfilename)
+        os.makedirs('data/', exist_ok=True)
+        r = requests.get(url, stream=True)
+        with open(tarfilepath, 'wb') as fd:
+            for content in r.iter_content():
+                fd.write(content)
+    if not os.path.exists(englishfile):
+        print('download complete! Extracting...')
+        with tarfile.open(tarfilepath) as tar:
+            tar.extractall(path='data/')
+        print('done!')
+        
+maybe_download()
 
 
 def build_full_vocabs():
@@ -36,18 +62,24 @@ def build_full_vocabs():
 
 def corpora2vectors(reverse_inputs=True, pad_spanish=True):
     with open(englishfile) as en_fd, open(spanishfile) as es_fd:
-        garbage_filter = lambda x: x.strip() and x.strip() != '.'
+        garbage_filter = lambda x: x.strip() and x.strip() != '.' # and len(x...
         eng = [en_lang.tokens2tensor(en_lang.word_tokenize(s, reverse=reverse_inputs)) for s in en_fd]
         es = [es_lang.tokens2tensor(es_lang.word_tokenize(s, pad=pad_spanish)) for s in es_fd]
     return eng, es
 
 
 en_lang, es_lang = build_full_vocabs()
-X, y = corpora2vectors()
-# with open('X.pkl', 'wb') as fd:
-#     pickle.dump(X, fd)
-# with open('y.pkl', 'wb') as fd:
-#     pickle.dump(y, fd)
+if os.path.exists('X.pkl'):
+    with open('X.pkl', 'rb') as fd:
+        X = pickle.load(fd)
+    with open('y.pkl', 'rb') as fd:
+        y = pickle.load(fd)
+else:
+    X, y = corpora2vectors()
+    with open('X.pkl', 'wb') as fd:
+        pickle.dump(X, fd)
+    with open('y.pkl', 'wb') as fd:
+        pickle.dump(y, fd)
 
 # filter vectors:
 X, y = zip(*((i, j) for i, j in zip(X, y) if len(i) and len(j) != 1))
@@ -82,8 +114,9 @@ for i, (xi, yi) in enumerate(zip(X_train, y_train)):
     y_train[i] = yi.cuda()
 
 
-nmt = NMT(encoder, decoder, nn.NLLLoss())
+nmt = NMT('nmt', encoder, decoder, nn.NLLLoss())
 nmt.train(X_train, y_train, epochs=100, batch_size=1, examples=X_test[:5])
+nmt.save()
 
 if True:
     import sys
